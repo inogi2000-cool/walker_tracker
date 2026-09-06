@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html lang="ko">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>수일여중 산책 루프 트래커</title>
+    <link rel="stylesheet" href="https://unpkg.com/leaflet@1.9.4/dist/leaflet.css" />
+    <script src="https://unpkg.com/leaflet@1.9.4/dist/leaflet.js"></script>
+    <style>
+        * { box-sizing: border-box; margin: 0; padding: 0; }
+        body, html { width: 100%; height: 100%; overflow: hidden; font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; }
+        
+        #app-container {
+            width: 100vw;
+            height: 100vh;
+            display: flex;
+            flex-direction: column;
+            position: relative;
+        }
+
+        #map {
+            width: 100%;
+            height: 100%;
+            z-index: 1;
+        }
+
+        /* 대시보드 UI */
+        .dashboard {
+            position: absolute;
+            top: 15px;
+            left: 50%;
+            transform: translateX(-50%);
+            width: 90%;
+            background: rgba(255, 255, 255, 0.95);
+            padding: 15px;
+            border-radius: 16px;
+            box-shadow: 0 4px 15px rgba(0,0,0,0.2);
+            z-index: 1000;
+            display: flex;
+            justify-content: space-around;
+            text-align: center;
+        }
+
+        .stat-item { display: flex; flex-direction: column; }
+        .stat-value { font-size: 1.5rem; font-weight: bold; color: #1a73e8; }
+        .stat-label { font-size: 0.75rem; color: #666; margin-top: 2px; }
+
+        /* 하단 컨트롤 버튼 */
+        .controls {
+            position: absolute;
+            bottom: 30px;
+            left: 50%;
+            transform: translateX(-50%);
+            z-index: 1000;
+            display: flex;
+            gap: 12px;
+        }
+
+        .btn {
+            padding: 14px 28px;
+            font-size: 1rem;
+            font-weight: bold;
+            border: none;
+            border-radius: 30px;
+            color: white;
+            box-shadow: 0 4px 10px rgba(0,0,0,0.3);
+            cursor: pointer;
+        }
+        
+        .btn-start { background-color: #34a853; }
+        .btn-stop { background-color: #ea4335; display: none; }
+    </style>
+</head>
+<body>
+
+<div id="app-container">
+    <div class="dashboard">
+        <div class="stat-item">
+            <span class="stat-value" id="lap-count">0</span>
+            <span class="stat-label">바퀴 수</span>
+        </div>
+        <div class="stat-item">
+            <span class="stat-value" id="total-distance">0.00</span>
+            <span class="stat-label">이동거리 (km)</span>
+        </div>
+    </div>
+
+    <div id="map"></div>
+
+    <div class="controls">
+        <button id="start-btn" class="btn btn-start" onclick="startTracking()">산책 시작</button>
+        <button id="stop-btn" class="btn btn-stop" onclick="stopTracking()">산책 종료</button>
+    </div>
+</div>
+
+<script>
+    // 수일여자중학교 좌표 (위도, 경도)
+    const SUIL_GIRLS_MIDDLE_SCHOOL = [37.3054, 127.0142];
+    
+    let map;
+    let polyline;
+    let currentMarker;
+    let watchPositionId = null;
+    let pathCoordinates = [];
+    
+    let totalDistanceMeters = 0;
+    let lapCount = 0;
+    let startPoint = null;
+    let hasLeftStartRadius = false;
+    
+    const START_THRESHOLD_METERS = 25; // 출발점 25m 이내 진입 시 1바퀴 인정
+
+    // 지도 초기화 (접속 시 바로 실행)
+    function initMap() {
+        // 1. 지도 생성 (수일여중 기준 확대)
+        map = L.map('map').setView(SUIL_GIRLS_MIDDLE_SCHOOL, 18);
+
+        // 2. 오픈스트리트맵 타일 레이어 추가 (무료, API 키 불필요)
+        L.tileLayer('https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png', {
+            maxZoom: 19,
+            attribution: '© OpenStreetMap'
+        }).addTo(map);
+
+        // 3. 이동 경로 표시용 선 생성
+        polyline = L.polyline([], { color: '#ff3366', weight: 6, opacity: 0.8 }).addTo(map);
+
+        // 접속하자마자 사용자에게 위치 권한 요청 및 초기 위치 표시
+        if (navigator.geolocation) {
+            navigator.geolocation.getCurrentPosition(
+                (pos) => {
+                    const userLatLng = [pos.coords.latitude, pos.coords.longitude];
+                    map.setView(userLatLng, 18);
+                    currentMarker = L.marker(userLatLng).addTo(map).bindPopup("현재 위치").openPopup();
+                },
+                (err) => console.log("위치 권한 대기 중..."),
+                { enableHighAccuracy: true }
+            );
+        }
+    }
+
+    // 산책 시작
+    function startTracking() {
+        if (!navigator.geolocation) {
+            alert('이 기기는 위치 추적을 지원하지 않습니다.');
+            return;
+        }
+
+        document.getElementById('start-btn').style.display = 'none';
+        document.getElementById('stop-btn').style.display = 'block';
+
+        // 위치 추적 시작 (실시간 위치 업링크)
+        watchPositionId = navigator.geolocation.watchPosition(
+            updatePosition,
+            (error) => alert('위치 서비스 승인이 필요합니다: ' + error.message),
+            { enableHighAccuracy: true, maximumAge: 0, timeout: 10000 }
+        );
+    }
+
+    // 위치 갱신 시 실행되는 함수
+    function updatePosition(position) {
+        const lat = position.coords.latitude;
+        const lng = position.coords.longitude;
+        const currentLatLng = [lat, lng];
+
+        if (pathCoordinates.length === 0) {
+            startPoint = currentLatLng;
+        } else {
+            const prevPoint = pathCoordinates[pathCoordinates.length - 1];
+            const distanceStep = getDistanceInMeters(prevPoint, currentLatLng);
+            totalDistanceMeters += distanceStep;
+            
+            checkLapCompletion(currentLatLng);
+        }
+
+        pathCoordinates.push(currentLatLng);
+
+        // 선 경로 업데이트 및 화면 이동
+        polyline.setLatLngs(pathCoordinates);
+        map.panTo(currentLatLng);
+
+        // 마커 위치 이동
+        if (currentMarker) {
+            currentMarker.setLatLng(currentLatLng);
+        } else {
+            currentMarker = L.marker(currentLatLng).addTo(map);
+        }
+
+        // 대시보드 수치 갱신
+        document.getElementById('total-distance').innerText = (totalDistanceMeters / 1000).toFixed(2);
+        document.getElementById('lap-count').innerText = lapCount;
+    }
+
+    // 바퀴 수 자동 판단
+    function checkLapCompletion(currentPoint) {
+        if (!startPoint) return;
+
+        const distanceFromStart = getDistanceInMeters(startPoint, currentPoint);
+
+        if (distanceFromStart > START_THRESHOLD_METERS * 2) {
+            hasLeftStartRadius = true;
+        }
+
+        if (hasLeftStartRadius && distanceFromStart <= START_THRESHOLD_METERS) {
+            lapCount++;
+            hasLeftStartRadius = false;
+        }
+    }
+
+    // 두 좌표 간 거리 계산 (미터 단위)
+    function getDistanceInMeters(coord1, coord2) {
+        const lat1 = coord1[0], lon1 = coord1[1];
+        const lat2 = coord2[0], lon2 = coord2[1];
+        const R = 6371e3;
+        const φ1 = lat1 * Math.PI / 180;
+        const φ2 = lat2 * Math.PI / 180;
+        const Δφ = (lat2 - lat1) * Math.PI / 180;
+        const Δλ = (lon2 - lon1) * Math.PI / 180;
+
+        const a = Math.sin(Δφ / 2) * Math.sin(Δφ / 2) +
+                  Math.cos(φ1) * Math.cos(φ2) *
+                  Math.sin(Δλ / 2) * Math.sin(Δλ / 2);
+        const c = 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
+
+        return R * c;
+    }
+
+    // 산책 종료
+    function stopTracking() {
+        if (watchPositionId !== null) {
+            navigator.geolocation.clearWatch(watchPositionId);
+            watchPositionId = null;
+        }
+        document.getElementById('start-btn').style.display = 'block';
+        document.getElementById('stop-btn').style.display = 'none';
+        alert(`산책 종료! 총 ${lapCount}바퀴 (${(totalDistanceMeters/1000).toFixed(2)}km) 이동하셨습니다.`);
+    }
+
+    // 페이지 로드 시 바로 지도 표시
+    window.onload = initMap;
+</script>
+</body>
+</html>
